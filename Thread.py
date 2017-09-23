@@ -1,15 +1,19 @@
 """
-Everything about GPIB control. The GUI should only allow one GPIB thread at a
-time.
-Thread also writes raw data file as CSV. Log files are written at event termination from graphframe.py.
+Everything about GPIB control.
+Thread also writes raw data file as CSV. Log files are written at event
+termination from graphframe.py.
 """
 
 import stuff
 import csv
 import time
-import wx
-import visa
+#The line below makes the program use the simulated visa. 
+import visa_simulated as visa
+#To use actual instruments you will need to comment it out and replace with
+#import visa
 import numpy as np
+
+
 
 class Algorithm(stuff.WorkerThread):
     """
@@ -18,34 +22,41 @@ class Algorithm(stuff.WorkerThread):
     def __init__(self,**kwargs):
         stuff.WorkerThread.__init__(self,**kwargs)
         #default settings
-        self.info = {'port':22,'harmonics' :6,'name':None,'bursts':6,'readings':1,'time':15,'rng':'AUTO','acdc':True,'ac':False,'mean':False,'time':15,'grid':'','LFREQ':False}
+        self.info = {
+            'port':22, #Visa port number, the 'GPIB::#::INSTR' added later.
+            'harmonics':6, #Number of harmonics to try to take into account.
+            'bursts':6, #Bursts per reading, as in the Swerlein's paper.
+            'readings':1, #Number of repetitions of a single reading algorithm.
+            'time':15, #Time to aim for per reading.
+            'rng':'AUTO', #Range for the instrument, if a specific range is desired. 
+            'mean':False, #Go through the mean(|V|) process, requires reading
+            #each individual data poiint from the machine which is very slow.
+            'LFREQ':False, #Zero in on the line frequencies instead of input.
+            'simulated':True} #Is it simulated or not?
+        
         #update info if kwarg is not empty
         self.grid_exists = False
         for key in kwargs:
             if kwargs[key]:
                 self.info[key] = kwargs[key]
-        if self.info['grid']:
-            self.grid_exists = True
-            self.row_count = 0
-            self.grid = self.info['grid']
-        #notify window and event not needed, will simply print to table anyway, and table is to be made optional. if table exists, then print to it
-        start_time = time.localtime()
-        log_file_name = 'log.'+str(start_time[0])+'.'+str(start_time[1])+'.'+str(start_time[2])+'.'+str(start_time[3])+'.'+str(start_time[4])+".txt"
-        raw_file_name = 'raw.'+str(start_time[0])+'.'+str(start_time[1])+'.'+str(start_time[2])+'.'+str(start_time[3])+'.'+str(start_time[4])+".csv"
-        self.csvfile = open(raw_file_name,'wb')
+
+        time_string = time.strftime("%Y.%m.%d.%H.%M.%S",time.localtime())
+        log_file_name = 'raw/log.'+time_string+".txt"
+        raw_file_name = 'raw/raw.'+time_string+".csv"
+        self.csvfile = open(raw_file_name,'w')
         self.logfile = open(log_file_name,'w')
         self.writer = csv.writer(self.csvfile)
         self.row_counter = 0
         grid_row = ["Time stamp [ms]","ACDC [V]","AC [V]","Error [ppm]","Frequency [Hz]"]
         self.print_grid_row(grid_row)
-        
-        self.start() #important that this is the last statement of initialisation. goes to run()
 
+        self.simulated = self.info['simulated']
+    
 
     def PrintSave(self, text):
         start_time = time.localtime()
-        time_string = str(start_time[0])+'.'+str(start_time[1])+'.'+str(start_time[2])+'.'+str(start_time[3])+'.'+str(start_time[4])+'.'+str(start_time[5])+" "
-        print(str(time_string)+str(text))
+        time_string = time.strftime("%Y.%m.%d.%H.%M.%S",time.localtime())
+        print(str(time_string)+' '+str(text))
         self.logfile.write(time_string+str(text))
         self.logfile.write('\n')
 
@@ -57,7 +68,13 @@ class Algorithm(stuff.WorkerThread):
         reading = self.instrument.read_raw()
         self.PrintSave('readings from instrument: '+str(reading))
         return reading
-
+    
+    def print_grid_row(self,info):
+        #save to csv
+        row = self.row_counter
+        self.writer.writerow(info)
+        #The funciton can be modified to also send info to a GUI.
+        
     def run(self):
         for run_number in range(self.info['readings']):
             self.single()
@@ -66,13 +83,14 @@ class Algorithm(stuff.WorkerThread):
         
     def single(self):
         def reset(self):
-            self.instrument.write('DISP OFF, RESET')
-            self.instrument.write('RESET')
-            self.instrument.write('end 2')
-            self.instrument.write('DISP OFF, READY')
+            self.WriteSave('DISP OFF, RESET')
+            self.WriteSave('RESET')
+            self.WriteSave('end 2')
+            self.WriteSave('DISP OFF, READY')
 
         rm = visa.ResourceManager()
-        self.instrument = rm.open_resource('GPIB0::'+str(self.info['port'])+'::INSTR')
+        address = 'GPIB0::'+str(self.info['port'])+'::INSTR'
+        self.instrument = rm.open_resource(address)
         self.instrument.timeout = 10000
 
         self.readings = []
@@ -81,10 +99,12 @@ class Algorithm(stuff.WorkerThread):
         self.AcArray = []
         self.MeanArray = []
         self.MemArray = []
-
+        
         reset(self)
-        error = self.instrument.query('ERR?')
-        if error != '0\r\n':
+
+        self.WriteSave('ERR?')
+        error = self.ReadSave()
+        if error != '0\r\n' and not self.simulated:
             self.csvfile.close()
             self.logfile.close()
             return #end the thread
@@ -179,7 +199,7 @@ class Algorithm(stuff.WorkerThread):
         if self.info['LFREQ'] == False: self.WriteSave('TRIG LEVEL;LEVEL 0,DC;DELAY 0;LFILTER ON') #trigger at 0 crossing of DC input
         else: self.WriteSave('TRIG LINE;DELAY 0;LFILTER ON') #Or trigger at the 0 crossing of the line frequency.
 
-        if self.info['LFREQ'] == False: #skip this routine if LFREQ is true, to save time since LFREQ changes rapidly.
+        if self.info['LFREQ'] == False and not self.simulated: #skip this routine if LFREQ is true, to save time since LFREQ changes rapidly.
             self.WriteSave('MSIZE?')
 
             memory_available = self.ReadSave().split(',') #generates 2 element list, first element is memory available for measuremnts
@@ -273,8 +293,6 @@ class Algorithm(stuff.WorkerThread):
             self.WriteSave('RMATH MEAN')
             Mean = float(self.ReadSave())
 
-            
-#a=Algorithm(harmonics = 8, readings = 1, LFREQ = True, bursts = 1,mean=True)
             if self.info['mean']==True:
                 self.WriteSave('OFORMAT ASCII')
                 to_read = min(Num,5120)
@@ -332,22 +350,6 @@ class Algorithm(stuff.WorkerThread):
         grid_row = [time.time(),Dcrms,Acrms,Err,Freq]
         self.print_grid_row(grid_row)
         return grid_row
-    def print_grid_row(self,info):
-        #save to csv
-        row = self.row_counter
-        self.writer.writerow(info)
-        #now if there is a grid, save to it too.
-        if self.grid_exists == True:
-            if self.grid.GetNumberRows< row+1:
-                self.grid.AppendRow()
-            if self.grid.GetNumberCols < len(info):
-                self.grid.AppendCol()
-            for i in range(len(info)):
-                self.grid.SetCellValue(self.row_counter,i,str(info[i]))
-        #next time it prints, go to the next row
-        self.row_counter = self.row_counter +1
-                
-
         
     def FNFreq(self,Expect):
         self.WriteSave("TARM HOLD;LFILTER ON;LEVEL 0,DC;FSOURCE ACDCV")
@@ -372,4 +374,7 @@ class Algorithm(stuff.WorkerThread):
 
         return Bw_corr
 
-
+if __name__ == '__main__':
+    a=Algorithm(readings=2)
+    a.start()
+    #a=Algorithm(port=22, harmonics=8, simulated=False)
