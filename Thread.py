@@ -1,15 +1,26 @@
 """
-Everything about GPIB control. The GUI should only allow one GPIB thread at a
-time.
-Thread also writes raw data file as CSV. Log files are written at event termination from graphframe.py.
+This is a python implementation of the Swerlein digital sampling
+algorithm written for the HP3458A. Many of the calculations have
+been left untouched.
+The program communicates with the instrument using national instrument's
+visa library. Commands are written and read only in two functions,
+ReadSave and WriteSave. Each read or write has a try block surrounding
+it to capture visa errors, if an error occurs it is reported and the thread
+terminates. All reading and writing is terminated, except for one command that
+it attempted in the abort method. Thread tries to send 'DCV AUTO' to protect
+the instrument.
 """
 
 import stuff
 import csv
 import time
-import wx
-import visa
+#The line below makes the program use the simulated visa. 
+import visa_simulated as visa
+#To use actual instruments you will need to comment it out and replace with
+#import visa
 import numpy as np
+
+
 
 class Algorithm(stuff.WorkerThread):
     """
@@ -18,61 +29,122 @@ class Algorithm(stuff.WorkerThread):
     def __init__(self,**kwargs):
         stuff.WorkerThread.__init__(self,**kwargs)
         #default settings
-        self.info = {'port':22,'harmonics' :6,'name':None,'bursts':6,'readings':1,'time':15,'rng':'AUTO','acdc':True,'ac':False,'mean':False,'time':15,'grid':'','LFREQ':False}
+        self.info = {
+            'port':22, #Visa port number, the 'GPIB::#::INSTR' added later.
+            'harmonics':6, #Number of harmonics to try to take into account.
+            'bursts':6, #Bursts per reading, as in the Swerlein's paper.
+            'readings':1, #Number of repetitions of a single reading algorithm.
+            'time':15, #Time to aim for per reading.
+            'rng':'AUTO', #Range for the instrument, if a specific range is desired. 
+            'mean':False, #Go through the mean(|V|) process, requires reading
+            #each individual data poiint from the machine which is very slow.
+            'LFREQ':False, #Zero in on the line frequencies instead of input.
+            'simulated':True} #Is it simulated or not?
+        
         #update info if kwarg is not empty
         self.grid_exists = False
         for key in kwargs:
             if kwargs[key]:
                 self.info[key] = kwargs[key]
-        if self.info['grid']:
-            self.grid_exists = True
-            self.row_count = 0
-            self.grid = self.info['grid']
-        #notify window and event not needed, will simply print to table anyway, and table is to be made optional. if table exists, then print to it
-        start_time = time.localtime()
-        log_file_name = 'log.'+str(start_time[0])+'.'+str(start_time[1])+'.'+str(start_time[2])+'.'+str(start_time[3])+'.'+str(start_time[4])+".txt"
-        raw_file_name = 'raw.'+str(start_time[0])+'.'+str(start_time[1])+'.'+str(start_time[2])+'.'+str(start_time[3])+'.'+str(start_time[4])+".csv"
-        self.csvfile = open(raw_file_name,'wb')
+
+        time_string = time.strftime("%Y.%m.%d.%H.%M.%S",time.localtime())
+        log_file_name = 'raw/log.'+time_string+".txt"
+        raw_file_name = 'raw/raw.'+time_string+".csv"
+        self.csvfile = open(raw_file_name,'w')
         self.logfile = open(log_file_name,'w')
         self.writer = csv.writer(self.csvfile)
         self.row_counter = 0
         grid_row = ["Time stamp [ms]","ACDC [V]","AC [V]","Error [ppm]","Frequency [Hz]"]
         self.print_grid_row(grid_row)
+
+        self.simulated = self.info['simulated']
+    
+    def abort(self):
+        """Called to flag the thread to stop."""
+        try:
+            #Send the Auto range comand, to protect the instrument.
+            self.instrument.write('DCV AUTO')
+        except visa.VisaIOError:
+            self.PrintSave('Instrument did not sucessfully set to AUTO range.')
+        self._want_abort = 1 #Now flag it to abort, no more printing.
+        self.logfile.close()
+        self.csvfile.close()
         
-        self.start() #important that this is the last statement of initialisation. goes to run()
-
-
     def PrintSave(self, text):
-        start_time = time.localtime()
-        time_string = str(start_time[0])+'.'+str(start_time[1])+'.'+str(start_time[2])+'.'+str(start_time[3])+'.'+str(start_time[4])+'.'+str(start_time[5])+" "
-        print(str(time_string)+str(text))
-        self.logfile.write(time_string+str(text))
-        self.logfile.write('\n')
+        """
+        Creates a message with date stamp and writes it to the log file.
+        """
+        if not self._want_abort:
+            start_time = time.localtime()
+            time_string = time.strftime("%Y.%m.%d.%H.%M.%S",time.localtime())
+            print(str(time_string)+' '+str(text))
+            self.logfile.write(time_string+str(text))
+            self.logfile.write('\n')
 
     def WriteSave(self,text):
-        self.PrintSave('writing: '+str(text))
-        self.instrument.write(text)
+        """
+        Calls PrintSave to record the writing event,
+        then writes text to instrument.
+        """
+        if not self._want_abort:
+            self.PrintSave('writing: '+str(text))
+            try:
+                self.instrument.write(text)
+            except visa.VisaIOError:
+                self.PrintSave('Writing FAILED')
+                self.abort()
 
     def ReadSave(self):
-        reading = self.instrument.read_raw()
-        self.PrintSave('readings from instrument: '+str(reading))
+        """
+        Reads instrument, and prints to the log file a date stamp and
+        the reading result. Then returns the reading.
+        """
+        reading = 1 #In case of no response from the instrument.
+        if not self._want_abort:
+            try:
+                reading = self.instrument.read_raw()
+            except visa.VisaIOError:
+                #Report the failure, then abort.
+                self.PrintSave('readings from instrument FAILED')
+                self.abort()
+            self.PrintSave('readings from instrument: '+str(reading))
         return reading
-
+    
+    def print_grid_row(self,info):
+        """
+        Uses csv.writer.writerow to write a row to a csv file.
+        """
+        if not self._want_abort:
+            self.writer.writerow(info)
+        #The funciton can be modified to also send info to a GUI.
+        
     def run(self):
+        """
+        Calling Start on the thread goes here, this repeats
+        a single repetition of the algorithm however many times are specified.
+        """
         for run_number in range(self.info['readings']):
             self.single()
         self.csvfile.close()
         self.logfile.close()
         
     def single(self):
+        """
+        A single run of the Swerlein algorithm.
+        """
         def reset(self):
-            self.instrument.write('DISP OFF, RESET')
-            self.instrument.write('RESET')
-            self.instrument.write('end 2')
-            self.instrument.write('DISP OFF, READY')
-
+            """
+            A reset funciton, might not be needed but I thought reset will
+            be used a few times. at the moment its just once.
+            """
+            self.WriteSave('DISP OFF, RESET')
+            self.WriteSave('RESET')
+            self.WriteSave('end 2')
+            self.WriteSave('DISP OFF, READY')
+        
         rm = visa.ResourceManager()
-        self.instrument = rm.open_resource('GPIB0::'+str(self.info['port'])+'::INSTR')
+        address = 'GPIB0::'+str(self.info['port'])+'::INSTR'
+        self.instrument = rm.open_resource(address)
         self.instrument.timeout = 10000
 
         self.readings = []
@@ -81,12 +153,15 @@ class Algorithm(stuff.WorkerThread):
         self.AcArray = []
         self.MeanArray = []
         self.MemArray = []
-
+        
         reset(self)
-        error = self.instrument.query('ERR?')
-        if error != '0\r\n':
-            self.csvfile.close()
-            self.logfile.close()
+
+        self.WriteSave('ERR?')
+        error = self.ReadSave()
+        if error != '0\r\n' and not self.simulated:
+            #If the error does not match the no error string.
+            self.PrintSave('Aborting.')
+            self.abort()
             return #end the thread
 
         Meas_time=15.0              # Target measure time
@@ -179,7 +254,7 @@ class Algorithm(stuff.WorkerThread):
         if self.info['LFREQ'] == False: self.WriteSave('TRIG LEVEL;LEVEL 0,DC;DELAY 0;LFILTER ON') #trigger at 0 crossing of DC input
         else: self.WriteSave('TRIG LINE;DELAY 0;LFILTER ON') #Or trigger at the 0 crossing of the line frequency.
 
-        if self.info['LFREQ'] == False: #skip this routine if LFREQ is true, to save time since LFREQ changes rapidly.
+        if self.info['LFREQ'] == False and not self.simulated: #skip this routine if LFREQ is true, to save time since LFREQ changes rapidly.
             self.WriteSave('MSIZE?')
 
             memory_available = self.ReadSave().split(',') #generates 2 element list, first element is memory available for measuremnts
@@ -273,8 +348,6 @@ class Algorithm(stuff.WorkerThread):
             self.WriteSave('RMATH MEAN')
             Mean = float(self.ReadSave())
 
-            
-#a=Algorithm(harmonics = 8, readings = 1, LFREQ = True, bursts = 1,mean=True)
             if self.info['mean']==True:
                 self.WriteSave('OFORMAT ASCII')
                 to_read = min(Num,5120)
@@ -332,22 +405,6 @@ class Algorithm(stuff.WorkerThread):
         grid_row = [time.time(),Dcrms,Acrms,Err,Freq]
         self.print_grid_row(grid_row)
         return grid_row
-    def print_grid_row(self,info):
-        #save to csv
-        row = self.row_counter
-        self.writer.writerow(info)
-        #now if there is a grid, save to it too.
-        if self.grid_exists == True:
-            if self.grid.GetNumberRows< row+1:
-                self.grid.AppendRow()
-            if self.grid.GetNumberCols < len(info):
-                self.grid.AppendCol()
-            for i in range(len(info)):
-                self.grid.SetCellValue(self.row_counter,i,str(info[i]))
-        #next time it prints, go to the next row
-        self.row_counter = self.row_counter +1
-                
-
         
     def FNFreq(self,Expect):
         self.WriteSave("TARM HOLD;LFILTER ON;LEVEL 0,DC;FSOURCE ACDCV")
@@ -372,4 +429,8 @@ class Algorithm(stuff.WorkerThread):
 
         return Bw_corr
 
-
+if __name__ == '__main__':
+    a=Algorithm(readings=1)
+    a.start()#Goes to the 'run' function, needed in order to set the thread going.
+    #Another example:
+    #a=Algorithm(port=22, harmonics=8, simulated=False)
