@@ -1,7 +1,14 @@
 """
-Everything about GPIB control.
-Thread also writes raw data file as CSV. Log files are written at event
-termination from graphframe.py.
+This is a python implementation of the Swerlein digital sampling
+algorithm written for the HP3458A. Many of the calculations have
+been left untouched.
+The program communicates with the instrument using national instrument's
+visa library. Commands are written and read only in two functions,
+ReadSave and WriteSave. Each read or write has a try block surrounding
+it to capture visa errors, if an error occurs it is reported and the thread
+terminates. All reading and writing is terminated, except for one command that
+it attempted in the abort method. Thread tries to send 'DCV AUTO' to protect
+the instrument.
 """
 
 import stuff
@@ -52,42 +59,89 @@ class Algorithm(stuff.WorkerThread):
 
         self.simulated = self.info['simulated']
     
-
+    def abort(self):
+        """Called to flag the thread to stop."""
+        try:
+            #Send the Auto range comand, to protect the instrument.
+            self.instrument.write('DCV AUTO')
+        except visa.VisaIOError:
+            self.PrintSave('Instrument did not sucessfully set to AUTO range.')
+        self._want_abort = 1 #Now flag it to abort, no more printing.
+        self.logfile.close()
+        self.csvfile.close()
+        
     def PrintSave(self, text):
-        start_time = time.localtime()
-        time_string = time.strftime("%Y.%m.%d.%H.%M.%S",time.localtime())
-        print(str(time_string)+' '+str(text))
-        self.logfile.write(time_string+str(text))
-        self.logfile.write('\n')
+        """
+        Creates a message with date stamp and writes it to the log file.
+        """
+        if not self._want_abort:
+            start_time = time.localtime()
+            time_string = time.strftime("%Y.%m.%d.%H.%M.%S",time.localtime())
+            print(str(time_string)+' '+str(text))
+            self.logfile.write(time_string+str(text))
+            self.logfile.write('\n')
 
     def WriteSave(self,text):
-        self.PrintSave('writing: '+str(text))
-        self.instrument.write(text)
+        """
+        Calls PrintSave to record the writing event,
+        then writes text to instrument.
+        """
+        if not self._want_abort:
+            self.PrintSave('writing: '+str(text))
+            try:
+                self.instrument.write(text)
+            except visa.VisaIOError:
+                self.PrintSave('Writing FAILED')
+                self.abort()
 
     def ReadSave(self):
-        reading = self.instrument.read_raw()
-        self.PrintSave('readings from instrument: '+str(reading))
+        """
+        Reads instrument, and prints to the log file a date stamp and
+        the reading result. Then returns the reading.
+        """
+        reading = 1 #In case of no response from the instrument.
+        if not self._want_abort:
+            try:
+                reading = self.instrument.read_raw()
+            except visa.VisaIOError:
+                #Report the failure, then abort.
+                self.PrintSave('readings from instrument FAILED')
+                self.abort()
+            self.PrintSave('readings from instrument: '+str(reading))
         return reading
     
     def print_grid_row(self,info):
-        #save to csv
-        row = self.row_counter
-        self.writer.writerow(info)
+        """
+        Uses csv.writer.writerow to write a row to a csv file.
+        """
+        if not self._want_abort:
+            self.writer.writerow(info)
         #The funciton can be modified to also send info to a GUI.
         
     def run(self):
+        """
+        Calling Start on the thread goes here, this repeats
+        a single repetition of the algorithm however many times are specified.
+        """
         for run_number in range(self.info['readings']):
             self.single()
         self.csvfile.close()
         self.logfile.close()
         
     def single(self):
+        """
+        A single run of the Swerlein algorithm.
+        """
         def reset(self):
+            """
+            A reset funciton, might not be needed but I thought reset will
+            be used a few times. at the moment its just once.
+            """
             self.WriteSave('DISP OFF, RESET')
             self.WriteSave('RESET')
             self.WriteSave('end 2')
             self.WriteSave('DISP OFF, READY')
-
+        
         rm = visa.ResourceManager()
         address = 'GPIB0::'+str(self.info['port'])+'::INSTR'
         self.instrument = rm.open_resource(address)
@@ -105,8 +159,9 @@ class Algorithm(stuff.WorkerThread):
         self.WriteSave('ERR?')
         error = self.ReadSave()
         if error != '0\r\n' and not self.simulated:
-            self.csvfile.close()
-            self.logfile.close()
+            #If the error does not match the no error string.
+            self.PrintSave('Aborting.')
+            self.abort()
             return #end the thread
 
         Meas_time=15.0              # Target measure time
@@ -375,6 +430,7 @@ class Algorithm(stuff.WorkerThread):
         return Bw_corr
 
 if __name__ == '__main__':
-    a=Algorithm(readings=2)
-    a.start()
+    a=Algorithm(readings=1)
+    a.start()#Goes to the 'run' function, needed in order to set the thread going.
+    #Another example:
     #a=Algorithm(port=22, harmonics=8, simulated=False)

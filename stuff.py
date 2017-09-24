@@ -30,32 +30,6 @@ class DataGen(object):
         else:
             self.data += delta
 
-class SharedList(object):
-    """
-    This structure should work for something more complicated. Not necessary for
-    just a list?
-    """
-    def __init__(self, item):
-        self.lock = threading.Lock()
-        self.item = item
-        self.value = [] # this initialisation makes it a list
-        
-    def add_to_list(self,item): # this method is list specific
-        self.lock.acquire()
-        self.value.append(item)
-        self.lock.release()
-        
-    def copy_list(self): # need a copy to avoid changes during plotting
-        self.lock.acquire()
-        a = self.value[:]
-        self.lock.release()
-        return a
-        
-    def reset_list(self):
-        self.lock.acquire()
-        self.value = []
-        self.lock.release()
-
 # Thread class that executes processing
 class WorkerThread(threading.Thread):
     """Worker Thread Class."""
